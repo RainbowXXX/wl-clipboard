@@ -392,8 +392,8 @@ bool HandcraftedBackend::copy(const wayland::SeatInfo&, Selection sel,
             if (op == zdcs::kEvSend) {
                 std::string mime = r.str();
                 int fd = cl.conn().pop_fd();
-                spdlog::debug("handcrafted source: send mime='{}' fd={}",
-                              mime, fd);
+                spdlog::info("[raw] clipboard fetched: mime='{}' bytes={} fd={} (served #{})",
+                             mime, st.data.bytes.size(), fd, st.served + 1);
                 if (fd >= 0) {
                     detail::serve_send(fd, st.data.bytes.data(),
                                        st.data.bytes.size());

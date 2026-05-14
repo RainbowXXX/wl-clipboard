@@ -27,7 +27,8 @@ struct CopyState {
 void on_source_target(void*, wl_data_source*, const char*) {}
 void on_source_send(void* data, wl_data_source*, const char* m, std::int32_t fd) {
     auto* st = static_cast<CopyState*>(data);
-    spdlog::debug("wl_data_source: send mime='{}' fd={}", m, fd);
+    spdlog::info("[wl] clipboard fetched: mime='{}' bytes={} fd={} (served #{})",
+                 m, st->data.bytes.size(), fd, st->served + 1);
     detail::serve_send(fd, st->data.bytes.data(), st->data.bytes.size());
     st->served++;
     if (st->oneshot) st->done = true;

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <poll.h>
@@ -169,6 +170,47 @@ std::string match_target(const AdvertisedTargets& t,
     return {};
 }
 
+// Look up "WM_CLASS" (or fall back to "_NET_WM_NAME"/"WM_NAME") of a window
+// so we can label the requester in logs. Returns "0x<id>" if nothing found.
+std::string describe_window(xcb_connection_t* c, xcb_window_t w) {
+    auto fetch = [&](xcb_atom_t prop, xcb_atom_t type, std::uint32_t max_words) {
+        std::string out;
+        auto cookie = xcb_get_property(c, 0, w, prop, type, 0, max_words);
+        auto* reply = xcb_get_property_reply(c, cookie, nullptr);
+        if (!reply) return out;
+        int len = xcb_get_property_value_length(reply);
+        if (len > 0) {
+            out.assign(static_cast<const char*>(xcb_get_property_value(reply)),
+                       static_cast<std::size_t>(len));
+        }
+        std::free(reply);
+        return out;
+    };
+    // WM_CLASS is two NUL-separated strings: instance \0 class \0
+    std::string wm_class = fetch(intern_atom(c, "WM_CLASS"), XCB_ATOM_STRING, 64);
+    if (!wm_class.empty()) {
+        auto sep = wm_class.find('\0');
+        std::string inst = wm_class.substr(0, sep);
+        std::string cls  = (sep != std::string::npos)
+                         ? wm_class.substr(sep + 1)
+                         : std::string();
+        // strip trailing NUL chars
+        while (!cls.empty() && cls.back() == '\0') cls.pop_back();
+        while (!inst.empty() && inst.back() == '\0') inst.pop_back();
+        if (!cls.empty() || !inst.empty()) {
+            return cls.empty() ? inst : (inst.empty() ? cls : inst + "/" + cls);
+        }
+    }
+    std::string net_name = fetch(intern_atom(c, "_NET_WM_NAME"),
+                                 intern_atom(c, "UTF8_STRING"), 64);
+    if (!net_name.empty()) return net_name;
+    std::string wm_name = fetch(XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 64);
+    if (!wm_name.empty()) return wm_name;
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "0x%x", w);
+    return buf;
+}
+
 void send_selection_notify(xcb_connection_t* c,
                            xcb_selection_request_event_t* req,
                            xcb_atom_t prop) {
@@ -309,35 +351,42 @@ bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
             }
             xcb_atom_t prop = req->property ? req->property : req->target;
 
+            std::string who = describe_window(x.conn, req->requestor);
+
             if (req->target == x.atoms.TARGETS) {
                 xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
                                     req->requestor, prop, XCB_ATOM_ATOM, 32,
                                     static_cast<std::uint32_t>(targets.atoms.size()),
                                     targets.atoms.data());
                 send_selection_notify(x.conn, req, prop);
+                spdlog::info("[x11] TARGETS queried by '{}' (win 0x{:x})",
+                             who, req->requestor);
             } else if (req->target == x.atoms.TIMESTAMP) {
                 std::uint32_t ts = XCB_CURRENT_TIME;
                 xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
                                     req->requestor, prop, XCB_ATOM_INTEGER, 32,
                                     1, &ts);
                 send_selection_notify(x.conn, req, prop);
+                spdlog::debug("[x11] TIMESTAMP queried by '{}'", who);
             } else {
                 std::string mime = match_target(targets, data.mime_types,
                                                 req->target, x.atoms);
                 if (mime.empty()) {
-                    spdlog::debug("x11: refuse target atom {} ('{}')",
-                                  req->target, atom_name(x.conn, req->target));
+                    spdlog::info("[x11] refused target '{}' from '{}' (win 0x{:x})",
+                                 atom_name(x.conn, req->target), who, req->requestor);
                     send_selection_notify(x.conn, req, XCB_ATOM_NONE);
                 } else {
-                    // INCR not implemented; server rejects oversized properties.
                     xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
                                         req->requestor, prop, req->target, 8,
                                         static_cast<std::uint32_t>(data.bytes.size()),
                                         data.bytes.data());
                     send_selection_notify(x.conn, req, prop);
                     served++;
-                    spdlog::debug("x11: served '{}' ({} bytes) to req 0x{:x}",
-                                  mime, data.bytes.size(), req->requestor);
+                    spdlog::info("[x11] clipboard fetched by '{}' (win 0x{:x}): "
+                                 "mime='{}' target='{}' bytes={} (served #{})",
+                                 who, req->requestor, mime,
+                                 atom_name(x.conn, req->target),
+                                 data.bytes.size(), served);
                     if (oneshot) lost = true;
                 }
             }
