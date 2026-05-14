@@ -22,10 +22,14 @@ struct PasteOpts {
 
 void print_usage() {
     std::cerr <<
-        "Usage: wlclip paste [options]\n"
+        "Usage: wlclip [-P PROTOCOL] [-p] paste [options]\n"
         "  -t, --type MIME       Receive this MIME exactly.\n"
         "  -l, --list-types      List offered MIME types.\n"
-        "  -n, --no-newline      Do not append trailing newline.\n";
+        "  -n, --no-newline      Do not append trailing newline.\n"
+        "\n"
+        "Protocol selection (global options, before 'paste'):\n"
+        "  -P, --protocol PROTO  auto (default) | wlr | wl\n"
+        "  -p, --primary         Read the primary selection.\n";
 }
 
 bool parse(const std::vector<std::string>& args, PasteOpts& o) {
@@ -56,11 +60,15 @@ int run_paste(const CommonOptions& common, const std::vector<std::string>& args)
     if (!seat) { spdlog::error("no usable seat"); return 1; }
     spdlog::debug("seat='{}'", seat->identifier);
 
-    auto backend = clipboard::make_backend(ws, common.backend.empty()
-                                                 ? std::string_view{"auto"}
-                                                 : std::string_view{common.backend});
-    if (!backend) { spdlog::error("no clipboard manager available"); return 1; }
-    spdlog::info("backend: {}", backend->name());
+    clipboard::BackendKind kind;
+    if (!clipboard::parse_backend_kind(common.backend, kind)) {
+        spdlog::error("unknown protocol '{}'. Expected: {}",
+                      common.backend, clipboard::backend_kind_names());
+        return 2;
+    }
+    auto backend = clipboard::make_backend(ws, kind);
+    if (!backend) return 1;
+    spdlog::info("using protocol: {}", backend->name());
 
     clipboard::PasteResult result;
     bool ok = backend->paste(*seat,

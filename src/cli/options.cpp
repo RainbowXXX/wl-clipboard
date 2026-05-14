@@ -38,7 +38,11 @@ void print_top_usage() {
         "Global options:\n"
         "  -d, --display NAME   Wayland display (default: $WAYLAND_DISPLAY).\n"
         "  -s, --seat ID        Seat index or wl_seat.name (default: first).\n"
-        "  -b, --backend B      'auto' (default), 'wlr', or 'wl'.\n"
+        "  -b, --backend B\n"
+        "  -P, --protocol B     Clipboard protocol. One of:\n"
+        "                         auto (default)\n"
+        "                         wlr | data-control | zwlr_data_control_v1\n"
+        "                         wl  | data-device  | wl_data_device_manager\n"
         "  -p, --primary        Primary selection.\n"
         "  -v, --verbose        Increase log verbosity (repeatable).\n"
         "  -q, --quiet          Errors only.\n"
@@ -56,7 +60,8 @@ ParseResult parse_global_options(const std::vector<std::string>& argv,
         std::string v;
         if (eat(argv, i, "-d", "--display", &v)) { opts.display = v; continue; }
         if (eat(argv, i, "-s", "--seat",    &v)) { opts.seat    = v; continue; }
-        if (eat(argv, i, "-b", "--backend", &v)) { opts.backend = v; continue; }
+        if (eat(argv, i, "-b", "--backend",  &v)) { opts.backend = v; continue; }
+        if (eat(argv, i, "-P", "--protocol", &v)) { opts.backend = v; continue; }
         if (a == "-p" || a == "--primary") { opts.primary = true; continue; }
         if (a == "-v" || a == "--verbose") { opts.verbosity++; continue; }
         if (a == "-q" || a == "--quiet")   { opts.quiet = true; continue; }

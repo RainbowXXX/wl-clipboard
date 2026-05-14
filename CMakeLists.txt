@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(wlclip CXX)
+project(wlclip C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,8 @@ option(WLCLIP_USE_SYSTEM_SPDLOG "Use system-installed spdlog instead of submodul
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 

@@ -31,12 +31,16 @@ struct CopyOpts {
 
 void print_usage() {
     std::cerr <<
-        "Usage: wlclip copy [options] [data...]\n"
+        "Usage: wlclip [-P PROTOCOL] [-p] copy [options] [data...]\n"
         "  -t, --type MIME       Advertise MIME (repeatable).\n"
         "  -n, --trim-newline    Strip trailing newline.\n"
         "  -o, --oneshot         Serve a single consumer and exit.\n"
         "  -c, --clear           Clear the selection.\n"
-        "  -f, --foreground      Stay foreground (default forks).\n";
+        "  -f, --foreground      Stay foreground (default forks).\n"
+        "\n"
+        "Protocol selection (global options, before 'copy'):\n"
+        "  -P, --protocol PROTO  auto (default) | wlr | wl\n"
+        "  -p, --primary         Operate on the primary selection.\n";
 }
 
 bool parse(const std::vector<std::string>& args, CopyOpts& o) {
@@ -126,6 +130,48 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
     CopyOpts opts;
     if (!parse(args, opts)) return 2;
 
+    clipboard::BackendKind kind;
+    if (!opts.clear && !clipboard::parse_backend_kind(common.backend, kind)) {
+        spdlog::error("unknown protocol '{}'. Expected: {}",
+                      common.backend, clipboard::backend_kind_names());
+        return 2;
+    }
+
+    // ---- foreground phase ----
+    // Read stdin (and any other state that depends on the controlling
+    // terminal / inherited file descriptors) BEFORE forking. After fork()
+    // the daemon will dup stdin/stdout to /dev/null.
+    clipboard::CopyData data;
+    if (!opts.clear) {
+        data.bytes = collect_payload(opts);
+        if (opts.mime_types.empty()) {
+            // Match wl-clipboard's MIME order: bare text/plain first so that
+            // clients that probe types sequentially get a usable answer
+            // immediately.
+            std::string guessed = core::guess_mime(data.bytes, "");
+            if (core::starts_with(guessed, "text/")) {
+                data.mime_types.push_back("text/plain;charset=utf-8");
+                data.mime_types.push_back("text/plain");
+                data.mime_types.push_back("UTF8_STRING");
+                data.mime_types.push_back("STRING");
+                data.mime_types.push_back("TEXT");
+            } else {
+                data.mime_types.push_back(std::move(guessed));
+            }
+        } else {
+            data.mime_types = opts.mime_types;
+        }
+    }
+
+    // Fork BEFORE connecting to Wayland. Forking with an already-open
+    // wl_display copies its internal state (buffers, mutex, ID counter,
+    // socket fd) into the child, which is fragile and observably breaks
+    // selection forwarding to wl_data_device consumers (e.g. GTK apps
+    // like gedit). Connecting after fork gives the daemon a clean,
+    // independent connection.
+    if (!opts.clear && !opts.foreground && !detach_to_background()) return 1;
+
+    // ---- background phase ----
     wayland::State ws;
     if (!ws.connect(common.display)) return 1;
     ws.initial_sync();
@@ -140,30 +186,9 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
 
     if (opts.clear) return handle_clear(ws, *seat, common.primary);
 
-    auto backend = clipboard::make_backend(ws, common.backend.empty()
-                                                 ? std::string_view{"auto"}
-                                                 : std::string_view{common.backend});
-    if (!backend) {
-        spdlog::error("compositor exposes no supported clipboard manager");
-        return 1;
-    }
-    spdlog::info("backend: {}", backend->name());
-
-    clipboard::CopyData data;
-    data.bytes = collect_payload(opts);
-    if (opts.mime_types.empty()) {
-        data.mime_types.push_back(core::guess_mime(data.bytes, ""));
-        if (core::starts_with(data.mime_types.front(), "text/")) {
-            data.mime_types.push_back("text/plain");
-            data.mime_types.push_back("TEXT");
-            data.mime_types.push_back("STRING");
-            data.mime_types.push_back("UTF8_STRING");
-        }
-    } else {
-        data.mime_types = opts.mime_types;
-    }
-
-    if (!opts.foreground && !detach_to_background()) return 1;
+    auto backend = clipboard::make_backend(ws, kind);
+    if (!backend) return 1;
+    spdlog::info("using protocol: {}", backend->name());
 
     bool ok = backend->copy(*seat,
                             common.primary ? clipboard::Selection::Primary

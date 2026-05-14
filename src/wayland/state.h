@@ -6,7 +6,9 @@
 
 struct wl_display;
 struct wl_registry;
+struct wl_registry_listener;
 struct wl_seat;
+struct wl_seat_listener;
 struct wl_data_device_manager;
 struct zwlr_data_control_manager_v1;
 
@@ -55,8 +57,8 @@ public:
     bool flush();
 
 private:
-    static const struct wl_registry_listener registry_listener_;
-    static const struct wl_seat_listener     seat_listener_;
+    static const ::wl_registry_listener registry_listener_;
+    static const ::wl_seat_listener     seat_listener_;
     static void on_global(void*, wl_registry*, std::uint32_t, const char*, std::uint32_t);
     static void on_global_remove(void*, wl_registry*, std::uint32_t);
     static void on_seat_capabilities(void*, wl_seat*, std::uint32_t);

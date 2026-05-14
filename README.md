@@ -50,6 +50,35 @@ Options:
 - `-DWLCLIP_USE_SYSTEM_SPDLOG=ON` — use a system spdlog instead of the
   submodule copy.
 
+### Cross-compiling for arm64 (aarch64)
+
+```sh
+# Debian/Ubuntu/UOS prerequisites:
+sudo dpkg --add-architecture arm64
+sudo apt update
+sudo apt install \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    pkg-config wayland-scanner \
+    libwayland-dev:arm64
+
+# Build:
+cmake -S . -B build-arm64 \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-linux-gnu.cmake \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build build-arm64 -j
+file build-arm64/wlclip   # → ELF 64-bit LSB executable, ARM aarch64
+```
+
+The toolchain file:
+- Picks up `aarch64-linux-gnu-{gcc,g++,ar,ranlib,strip,ld}`. Override with
+  `-DCROSS_TRIPLE=...` if your toolchain uses a different prefix.
+- Forces `wayland-scanner` (a build-host code generator) to be located on
+  PATH rather than in the target sysroot.
+- Points `pkg-config` at `/usr/lib/aarch64-linux-gnu/pkgconfig` so
+  `libwayland-client` resolves to the arm64 package.
+- Pass `-DCROSS_SYSROOT=/path/to/sysroot` if you build against a sysroot
+  instead of multiarch packages.
+
 ## Usage
 
 ```sh

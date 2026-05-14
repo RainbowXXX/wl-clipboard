@@ -10,12 +10,12 @@
 
 namespace wlclip::wayland {
 
-const wl_registry_listener State::registry_listener_ = {
+const ::wl_registry_listener State::registry_listener_ = {
     &State::on_global,
     &State::on_global_remove,
 };
 
-const wl_seat_listener State::seat_listener_ = {
+const ::wl_seat_listener State::seat_listener_ = {
     &State::on_seat_capabilities,
     &State::on_seat_name,
 };

@@ -4,10 +4,21 @@
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
-pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
+
+# wayland-scanner is a BUILD-machine tool. When cross-compiling, the cross
+# pkg-config would point at the target sysroot's binary which won't run on
+# the host, so we look it up on PATH first and only fall back to pkg-config.
+find_program(WAYLAND_SCANNER NAMES wayland-scanner)
 if(NOT WAYLAND_SCANNER)
-    find_program(WAYLAND_SCANNER NAMES wayland-scanner REQUIRED)
+    pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
 endif()
+if(NOT WAYLAND_SCANNER)
+    message(FATAL_ERROR
+        "wayland-scanner not found. Install it on the build machine "
+        "(e.g. 'apt install wayland-scanner' on Debian/Ubuntu) and ensure "
+        "it is on PATH.")
+endif()
+message(STATUS "wayland-scanner: ${WAYLAND_SCANNER}")
 
 set(WL_PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${WL_PROTO_GEN_DIR})
@@ -31,6 +42,7 @@ function(wlclip_add_protocol xml_path out_basename)
 endfunction()
 
 add_library(wlproto STATIC)
+set_target_properties(wlproto PROPERTIES LINKER_LANGUAGE C)
 target_include_directories(wlproto PUBLIC ${WL_PROTO_GEN_DIR})
 target_link_libraries(wlproto PUBLIC PkgConfig::WAYLAND_CLIENT)
 

@@ -1,6 +1,6 @@
 #include "core/log.h"
 
-#include <spdlog/sinks/stderr_color_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <memory>
 
