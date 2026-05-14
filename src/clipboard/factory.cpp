@@ -3,6 +3,7 @@
 #include "clipboard/data_control.h"
 #include "clipboard/data_device.h"
 #include "clipboard/handcrafted.h"
+#include "clipboard/x11.h"
 #include "core/log.h"
 #include "wayland/state.h"
 
@@ -23,11 +24,15 @@ bool parse_backend_kind(std::string_view name, BackendKind& out) {
         name == "hand") {
         out = BackendKind::HandcraftedControl; return true;
     }
+    if (name == "x11" || name == "xcb") {
+        out = BackendKind::X11; return true;
+    }
     return false;
 }
 
 const char* backend_kind_names() {
-    return "auto | wlr|data-control | wl|data-device | raw|wlr-raw|handcrafted";
+    return "auto | wlr|data-control | wl|data-device | "
+           "raw|wlr-raw|handcrafted | x11|xcb";
 }
 
 std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind,
@@ -54,6 +59,10 @@ std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind,
             // The handcrafted backend doesn't consult `state` — it opens its
             // own raw socket and rediscovers globals from scratch.
             return std::make_unique<HandcraftedBackend>(display, seat);
+
+        case BackendKind::X11:
+            // X11 backend opens its own xcb connection to $DISPLAY.
+            return std::make_unique<X11Backend>(display, seat);
 
         case BackendKind::Auto:
         default:

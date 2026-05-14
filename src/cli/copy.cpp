@@ -3,6 +3,7 @@
 #include "clipboard/backend.h"
 #include "clipboard/factory.h"
 #include "clipboard/handcrafted.h"
+#include "clipboard/x11.h"
 #include "core/fd.h"
 #include "core/log.h"
 #include "core/mime.h"
@@ -179,6 +180,23 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
             return 1;
         }
         clipboard::HandcraftedBackend backend(common.display, common.seat);
+        wayland::SeatInfo dummy{};
+        spdlog::info("using protocol: {}", backend.name());
+        bool ok = backend.copy(dummy,
+                               common.primary ? clipboard::Selection::Primary
+                                              : clipboard::Selection::Regular,
+                               std::move(data),
+                               opts.oneshot);
+        return ok ? 0 : 1;
+    }
+
+    // ---- X11 (no libwayland) fast path ----
+    if (kind == clipboard::BackendKind::X11) {
+        if (opts.clear) {
+            spdlog::error("--clear is not implemented for the X11 backend");
+            return 1;
+        }
+        clipboard::X11Backend backend(common.display, common.seat);
         wayland::SeatInfo dummy{};
         spdlog::info("using protocol: {}", backend.name());
         bool ok = backend.copy(dummy,

@@ -3,9 +3,10 @@ add_library(wlclip_clipboard STATIC
     data_control.cpp
     data_device.cpp
     handcrafted.cpp
+    x11.cpp
     factory.cpp
 )
 target_include_directories(wlclip_clipboard PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(wlclip_clipboard
-    PUBLIC  wlclip_wayland wlclip_wire wlclip_core wlproto
+    PUBLIC  wlclip_wayland wlclip_wire wlclip_core wlproto PkgConfig::XCB
 )

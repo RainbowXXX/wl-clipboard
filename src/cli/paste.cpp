@@ -3,6 +3,7 @@
 #include "clipboard/backend.h"
 #include "clipboard/factory.h"
 #include "clipboard/handcrafted.h"
+#include "clipboard/x11.h"
 #include "core/fd.h"
 #include "core/log.h"
 #include "core/mime.h"
@@ -66,6 +67,14 @@ int run_paste(const CommonOptions& common, const std::vector<std::string>& args)
     if (kind == clipboard::BackendKind::HandcraftedControl) {
         // No libwayland connection on this path.
         clipboard::HandcraftedBackend backend(common.display, common.seat);
+        wayland::SeatInfo dummy{};
+        spdlog::info("using protocol: {}", backend.name());
+        ok = backend.paste(dummy,
+                           common.primary ? clipboard::Selection::Primary
+                                          : clipboard::Selection::Regular,
+                           opts.type, opts.list_types, result);
+    } else if (kind == clipboard::BackendKind::X11) {
+        clipboard::X11Backend backend(common.display, common.seat);
         wayland::SeatInfo dummy{};
         spdlog::info("using protocol: {}", backend.name());
         ok = backend.paste(dummy,

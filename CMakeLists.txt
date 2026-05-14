@@ -37,5 +37,8 @@ endif()
 # ---- Wayland scanner + protocol code ------------------------------------
 include(cmake/WaylandProtocols.cmake)
 
+# ---- libxcb (for X11 backend) -------------------------------------------
+pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb)
+
 # ---- Sources ------------------------------------------------------------
 add_subdirectory(src)

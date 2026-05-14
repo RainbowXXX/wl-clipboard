@@ -14,6 +14,7 @@ enum class BackendKind {
     DataControl,        // zwlr_data_control_v1 (via libwayland)
     DataDevice,         // wl_data_device_manager (via libwayland)
     HandcraftedControl, // zwlr_data_control_v1 hand-rolled (no libwayland)
+    X11,                // X11 CLIPBOARD/PRIMARY via libxcb
 };
 
 // Parse a user-supplied backend/protocol selector. Accepts (case sensitive):
