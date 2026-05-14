@@ -1,0 +1,92 @@
+#include "cli/commands.h"
+
+#include "clipboard/backend.h"
+#include "clipboard/factory.h"
+#include "core/fd.h"
+#include "core/log.h"
+#include "core/mime.h"
+#include "wayland/state.h"
+
+#include <iostream>
+#include <unistd.h>
+
+namespace wlclip::cli {
+
+namespace {
+
+struct PasteOpts {
+    std::string type;
+    bool list_types = false;
+    bool no_newline = false;
+};
+
+void print_usage() {
+    std::cerr <<
+        "Usage: wlclip paste [options]\n"
+        "  -t, --type MIME       Receive this MIME exactly.\n"
+        "  -l, --list-types      List offered MIME types.\n"
+        "  -n, --no-newline      Do not append trailing newline.\n";
+}
+
+bool parse(const std::vector<std::string>& args, PasteOpts& o) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const auto& a = args[i];
+        if (a == "-t" || a == "--type") {
+            if (i + 1 >= args.size()) { spdlog::error("--type needs a value"); return false; }
+            o.type = args[++i];
+        } else if (a == "-l" || a == "--list-types") o.list_types = true;
+        else if (a == "-n" || a == "--no-newline")   o.no_newline = true;
+        else if (a == "-h" || a == "--help") { print_usage(); return false; }
+        else { spdlog::error("unknown argument: {}", a); print_usage(); return false; }
+    }
+    return true;
+}
+
+}  // namespace
+
+int run_paste(const CommonOptions& common, const std::vector<std::string>& args) {
+    PasteOpts opts;
+    if (!parse(args, opts)) return 2;
+
+    wayland::State ws;
+    if (!ws.connect(common.display)) return 1;
+    ws.initial_sync();
+
+    const auto* seat = ws.pick_seat(common.seat);
+    if (!seat) { spdlog::error("no usable seat"); return 1; }
+    spdlog::debug("seat='{}'", seat->identifier);
+
+    auto backend = clipboard::make_backend(ws, common.backend.empty()
+                                                 ? std::string_view{"auto"}
+                                                 : std::string_view{common.backend});
+    if (!backend) { spdlog::error("no clipboard manager available"); return 1; }
+    spdlog::info("backend: {}", backend->name());
+
+    clipboard::PasteResult result;
+    bool ok = backend->paste(*seat,
+                             common.primary ? clipboard::Selection::Primary
+                                            : clipboard::Selection::Regular,
+                             opts.type, opts.list_types, result);
+    if (!ok) return 1;
+
+    if (opts.list_types) {
+        for (const auto& m : result.available) std::cout << m << '\n';
+        return 0;
+    }
+
+    if (!result.bytes.empty() &&
+        !core::write_all(STDOUT_FILENO, result.bytes.data(), result.bytes.size())) {
+        return 1;
+    }
+    if (!opts.no_newline && core::is_textual(result.mime)) {
+        bool has_trailing = !result.bytes.empty() &&
+                            result.bytes.back() == std::byte{'\n'};
+        if (!has_trailing) {
+            const char nl = '\n';
+            ::write(STDOUT_FILENO, &nl, 1);
+        }
+    }
+    return 0;
+}
+
+}  // namespace wlclip::cli
