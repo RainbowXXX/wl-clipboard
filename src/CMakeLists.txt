@@ -1,4 +1,5 @@
 add_subdirectory(core)
+add_subdirectory(wire)
 add_subdirectory(wayland)
 add_subdirectory(clipboard)
 add_subdirectory(cli)

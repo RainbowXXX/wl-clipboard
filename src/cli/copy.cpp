@@ -2,6 +2,7 @@
 
 #include "clipboard/backend.h"
 #include "clipboard/factory.h"
+#include "clipboard/handcrafted.h"
 #include "core/fd.h"
 #include "core/log.h"
 #include "core/mime.h"
@@ -171,7 +172,24 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
     // independent connection.
     if (!opts.clear && !opts.foreground && !detach_to_background()) return 1;
 
-    // ---- background phase ----
+    // ---- Handcrafted (no libwayland) fast path ----
+    if (kind == clipboard::BackendKind::HandcraftedControl) {
+        if (opts.clear) {
+            spdlog::error("--clear is not implemented for the handcrafted backend");
+            return 1;
+        }
+        clipboard::HandcraftedBackend backend(common.display, common.seat);
+        wayland::SeatInfo dummy{};
+        spdlog::info("using protocol: {}", backend.name());
+        bool ok = backend.copy(dummy,
+                               common.primary ? clipboard::Selection::Primary
+                                              : clipboard::Selection::Regular,
+                               std::move(data),
+                               opts.oneshot);
+        return ok ? 0 : 1;
+    }
+
+    // ---- libwayland background phase ----
     wayland::State ws;
     if (!ws.connect(common.display)) return 1;
     ws.initial_sync();
@@ -186,7 +204,7 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
 
     if (opts.clear) return handle_clear(ws, *seat, common.primary);
 
-    auto backend = clipboard::make_backend(ws, kind);
+    auto backend = clipboard::make_backend(ws, kind, common.display, common.seat);
     if (!backend) return 1;
     spdlog::info("using protocol: {}", backend->name());
 

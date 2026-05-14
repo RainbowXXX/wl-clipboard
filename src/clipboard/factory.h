@@ -11,8 +11,9 @@ namespace wlclip::clipboard {
 
 enum class BackendKind {
     Auto,
-    DataControl,    // zwlr_data_control_v1
-    DataDevice,     // wl_data_device_manager
+    DataControl,        // zwlr_data_control_v1 (via libwayland)
+    DataDevice,         // wl_data_device_manager (via libwayland)
+    HandcraftedControl, // zwlr_data_control_v1 hand-rolled (no libwayland)
 };
 
 // Parse a user-supplied backend/protocol selector. Accepts (case sensitive):
@@ -27,6 +28,12 @@ const char* backend_kind_names();
 
 // Construct a backend instance. Returns nullptr if the requested protocol is
 // not advertised by the compositor (or, for Auto, if neither is).
-std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind);
+//
+// The libwayland-using backends (DataControl, DataDevice) consult `state`
+// to find globals and seats. The handcrafted backend opens its own raw
+// connection; `display` and `seat` come from the CLI options.
+std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind,
+                                      const std::string& display,
+                                      const std::string& seat);
 
 }

@@ -2,6 +2,7 @@
 
 #include "clipboard/backend.h"
 #include "clipboard/factory.h"
+#include "clipboard/handcrafted.h"
 #include "core/fd.h"
 #include "core/log.h"
 #include "core/mime.h"
@@ -52,29 +53,41 @@ int run_paste(const CommonOptions& common, const std::vector<std::string>& args)
     PasteOpts opts;
     if (!parse(args, opts)) return 2;
 
-    wayland::State ws;
-    if (!ws.connect(common.display)) return 1;
-    ws.initial_sync();
-
-    const auto* seat = ws.pick_seat(common.seat);
-    if (!seat) { spdlog::error("no usable seat"); return 1; }
-    spdlog::debug("seat='{}'", seat->identifier);
-
     clipboard::BackendKind kind;
     if (!clipboard::parse_backend_kind(common.backend, kind)) {
         spdlog::error("unknown protocol '{}'. Expected: {}",
                       common.backend, clipboard::backend_kind_names());
         return 2;
     }
-    auto backend = clipboard::make_backend(ws, kind);
-    if (!backend) return 1;
-    spdlog::info("using protocol: {}", backend->name());
 
     clipboard::PasteResult result;
-    bool ok = backend->paste(*seat,
-                             common.primary ? clipboard::Selection::Primary
-                                            : clipboard::Selection::Regular,
-                             opts.type, opts.list_types, result);
+    bool ok = false;
+
+    if (kind == clipboard::BackendKind::HandcraftedControl) {
+        // No libwayland connection on this path.
+        clipboard::HandcraftedBackend backend(common.display, common.seat);
+        wayland::SeatInfo dummy{};
+        spdlog::info("using protocol: {}", backend.name());
+        ok = backend.paste(dummy,
+                           common.primary ? clipboard::Selection::Primary
+                                          : clipboard::Selection::Regular,
+                           opts.type, opts.list_types, result);
+    } else {
+        wayland::State ws;
+        if (!ws.connect(common.display)) return 1;
+        ws.initial_sync();
+        const auto* seat = ws.pick_seat(common.seat);
+        if (!seat) { spdlog::error("no usable seat"); return 1; }
+        spdlog::debug("seat='{}'", seat->identifier);
+
+        auto backend = clipboard::make_backend(ws, kind, common.display, common.seat);
+        if (!backend) return 1;
+        spdlog::info("using protocol: {}", backend->name());
+        ok = backend->paste(*seat,
+                            common.primary ? clipboard::Selection::Primary
+                                           : clipboard::Selection::Regular,
+                            opts.type, opts.list_types, result);
+    }
     if (!ok) return 1;
 
     if (opts.list_types) {

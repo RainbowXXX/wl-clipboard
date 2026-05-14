@@ -2,30 +2,37 @@
 
 #include "clipboard/data_control.h"
 #include "clipboard/data_device.h"
+#include "clipboard/handcrafted.h"
 #include "core/log.h"
 #include "wayland/state.h"
 
 namespace wlclip::clipboard {
 
 bool parse_backend_kind(std::string_view name, BackendKind& out) {
-    if (name.empty() || name == "auto") { out = BackendKind::Auto;        return true; }
+    if (name.empty() || name == "auto") { out = BackendKind::Auto; return true; }
     if (name == "wlr" || name == "data-control" ||
         name == "zwlr_data_control_v1" ||
         name == "zwlr_data_control_unstable_v1") {
         out = BackendKind::DataControl; return true;
     }
-    if (name == "wl"  || name == "data-device"  ||
+    if (name == "wl"  || name == "data-device" ||
         name == "wl_data_device_manager") {
         out = BackendKind::DataDevice;  return true;
+    }
+    if (name == "raw" || name == "wlr-raw" || name == "handcrafted" ||
+        name == "hand") {
+        out = BackendKind::HandcraftedControl; return true;
     }
     return false;
 }
 
 const char* backend_kind_names() {
-    return "auto | wlr|data-control|zwlr_data_control_v1 | wl|data-device|wl_data_device_manager";
+    return "auto | wlr|data-control | wl|data-device | raw|wlr-raw|handcrafted";
 }
 
-std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind) {
+std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind,
+                                      const std::string& display,
+                                      const std::string& seat) {
     switch (kind) {
         case BackendKind::DataControl:
             if (!state.data_control_manager()) {
@@ -42,6 +49,11 @@ std::unique_ptr<Backend> make_backend(wayland::State& state, BackendKind kind) {
                 return nullptr;
             }
             return std::make_unique<DataDeviceBackend>(state);
+
+        case BackendKind::HandcraftedControl:
+            // The handcrafted backend doesn't consult `state` — it opens its
+            // own raw socket and rediscovers globals from scratch.
+            return std::make_unique<HandcraftedBackend>(display, seat);
 
         case BackendKind::Auto:
         default:
