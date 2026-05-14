@@ -232,6 +232,7 @@ struct CopyState {
     bool          done      = false;
     bool          cancelled = false;
     int           served    = 0;
+    int           cancel_count = 0;  // total cancelled events received
 };
 
 struct PasteState {
@@ -400,10 +401,24 @@ bool HandcraftedBackend::copy(const wayland::SeatInfo&, Selection sel,
                 st.served++;
                 if (st.oneshot) st.done = true;
             } else if (op == zdcs::kEvCancelled) {
-                spdlog::debug("handcrafted source: cancelled (served={})",
-                              st.served);
-                st.cancelled = true;
-                st.done = true;
+                st.cancel_count++;
+                // First cancelled is treated as potentially spurious: some
+                // compositors / clipboard managers have been observed to
+                // emit a premature `cancelled` and then call `receive`
+                // anyway, which — if we had already torn down the source —
+                // would return garbage (e.g. a pipe of NULs). Stay alive
+                // through the first one and only honour the second.
+                if (st.cancel_count == 1) {
+                    spdlog::warn("handcrafted source: cancelled #1 ignored "
+                                 "(served={}, staying alive for late receive)",
+                                 st.served);
+                } else {
+                    spdlog::debug("handcrafted source: cancelled #{} "
+                                  "(served={}) — exiting",
+                                  st.cancel_count, st.served);
+                    st.cancelled = true;
+                    st.done = true;
+                }
             }
             return;
         }
