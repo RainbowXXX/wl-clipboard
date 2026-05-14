@@ -63,7 +63,13 @@ ParseResult parse_global_options(const std::vector<std::string>& argv,
         if (eat(argv, i, "-b", "--backend",  &v)) { opts.backend = v; continue; }
         if (eat(argv, i, "-P", "--protocol", &v)) { opts.backend = v; continue; }
         if (a == "-p" || a == "--primary") { opts.primary = true; continue; }
-        if (a == "-v" || a == "--verbose") { opts.verbosity++; continue; }
+        if (a == "--verbose") { opts.verbosity++; continue; }
+        // Accept -v, -vv, -vvv, ... as repeated verbosity bumps.
+        if (a.size() >= 2 && a[0] == '-' && a[1] == 'v' &&
+            a.find_first_not_of('v', 1) == std::string::npos) {
+            opts.verbosity += static_cast<int>(a.size() - 1);
+            continue;
+        }
         if (a == "-q" || a == "--quiet")   { opts.quiet = true; continue; }
         if (a == "--version") {
             std::cout << "wlclip 0.1.0\n";
