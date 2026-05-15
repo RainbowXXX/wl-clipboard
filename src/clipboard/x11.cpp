@@ -73,9 +73,10 @@ xcb_atom_t selection_atom(const Atoms& a, Selection sel) {
 // ---- Connection wrapper ------------------------------------------------
 
 struct X11Connection {
-    xcb_connection_t* conn   = nullptr;
-    xcb_screen_t*     screen = nullptr;
-    xcb_window_t      window = 0;
+    xcb_connection_t* conn       = nullptr;
+    xcb_screen_t*     screen     = nullptr;
+    xcb_window_t      window     = 0;
+    xcb_timestamp_t   owner_time = XCB_CURRENT_TIME;  // real server time used in SetSelectionOwner
     Atoms             atoms;
 
     ~X11Connection() {
@@ -211,6 +212,31 @@ std::string describe_window(xcb_connection_t* c, xcb_window_t w) {
     return buf;
 }
 
+// Acquire a real server timestamp by triggering a zero-length PropertyNotify
+// on our own window. ICCCM §2.1/§2.6.2 require the SetSelectionOwner time and
+// the TIMESTAMP target reply to be a real server time, not CurrentTime (0).
+// Some compositors (notably kwin/xwayland) treat a 0 timestamp as suspicious
+// and add an internal debounce/verification delay (~150ms+) before propagating
+// the X11 selection to Wayland clients. Returning a real time eliminates that.
+xcb_timestamp_t acquire_server_time(X11Connection& x) {
+    xcb_change_property(x.conn, XCB_PROP_MODE_APPEND, x.window,
+                        XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, 0, nullptr);
+    xcb_flush(x.conn);
+    while (auto* ev = xcb_wait_for_event(x.conn)) {
+        std::unique_ptr<xcb_generic_event_t, decltype(&std::free)>
+            guard(ev, &std::free);
+        if ((ev->response_type & ~0x80) == XCB_PROPERTY_NOTIFY) {
+            auto* pn = reinterpret_cast<xcb_property_notify_event_t*>(ev);
+            if (pn->window == x.window && pn->atom == XCB_ATOM_WM_NAME) {
+                return pn->time;
+            }
+        }
+        // Drop any other events; the window is brand-new and unmapped, so
+        // nothing else is expected here.
+    }
+    return XCB_CURRENT_TIME;
+}
+
 void send_selection_notify(xcb_connection_t* c,
                            xcb_selection_request_event_t* req,
                            xcb_atom_t prop) {
@@ -315,7 +341,8 @@ bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
     xcb_atom_t selatom = selection_atom(x.atoms, sel);
     AdvertisedTargets targets = build_targets(x.conn, x.atoms, data.mime_types);
 
-    xcb_set_selection_owner(x.conn, x.window, selatom, XCB_CURRENT_TIME);
+    x.owner_time = acquire_server_time(x);
+    xcb_set_selection_owner(x.conn, x.window, selatom, x.owner_time);
     xcb_flush(x.conn);
 
     auto own_c = xcb_get_selection_owner(x.conn, selatom);
@@ -362,7 +389,7 @@ bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
                 spdlog::info("[x11] TARGETS queried by '{}' (win 0x{:x})",
                              who, req->requestor);
             } else if (req->target == x.atoms.TIMESTAMP) {
-                std::uint32_t ts = XCB_CURRENT_TIME;
+                std::uint32_t ts = x.owner_time;
                 xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
                                     req->requestor, prop, XCB_ATOM_INTEGER, 32,
                                     1, &ts);
