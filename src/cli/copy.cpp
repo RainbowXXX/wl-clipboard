@@ -165,6 +165,29 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
         }
     }
 
+    // ---- X11 (no libwayland) fast path ----
+    // Handled BEFORE the generic detach_to_background() below because the X11
+    // backend needs to acquire+verify selection ownership in the *parent*
+    // process and only fork afterwards (xclip-style). Forking first and then
+    // doing the X handshake in a setsid'd orphan adds ~150ms of latency
+    // between "shell command returns" and "Xwayland/compositor sees the new
+    // X11 owner", which any outside observer polling the clipboard will see.
+    if (kind == clipboard::BackendKind::X11) {
+        if (opts.clear) {
+            spdlog::error("--clear is not implemented for the X11 backend");
+            return 1;
+        }
+        clipboard::X11Backend backend(common.display, common.seat);
+        spdlog::info("using protocol: {}", backend.name());
+        bool ok = backend.copy_acquire_then_detach(
+            common.primary ? clipboard::Selection::Primary
+                           : clipboard::Selection::Regular,
+            std::move(data),
+            opts.oneshot,
+            /*detach=*/!opts.foreground);
+        return ok ? 0 : 1;
+    }
+
     // Fork BEFORE connecting to Wayland. Forking with an already-open
     // wl_display copies its internal state (buffers, mutex, ID counter,
     // socket fd) into the child, which is fragile and observably breaks
@@ -180,23 +203,6 @@ int run_copy(const CommonOptions& common, const std::vector<std::string>& args) 
             return 1;
         }
         clipboard::HandcraftedBackend backend(common.display, common.seat);
-        wayland::SeatInfo dummy{};
-        spdlog::info("using protocol: {}", backend.name());
-        bool ok = backend.copy(dummy,
-                               common.primary ? clipboard::Selection::Primary
-                                              : clipboard::Selection::Regular,
-                               std::move(data),
-                               opts.oneshot);
-        return ok ? 0 : 1;
-    }
-
-    // ---- X11 (no libwayland) fast path ----
-    if (kind == clipboard::BackendKind::X11) {
-        if (opts.clear) {
-            spdlog::error("--clear is not implemented for the X11 backend");
-            return 1;
-        }
-        clipboard::X11Backend backend(common.display, common.seat);
         wayland::SeatInfo dummy{};
         spdlog::info("using protocol: {}", backend.name());
         bool ok = backend.copy(dummy,

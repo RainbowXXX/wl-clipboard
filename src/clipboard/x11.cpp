@@ -6,13 +6,17 @@
 #include <xcb/xcb.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <poll.h>
 #include <string>
 #include <string_view>
+#include <sys/types.h>
+#include <unistd.h>
 #include <vector>
 
 namespace wlclip::clipboard {
@@ -329,25 +333,40 @@ std::vector<std::byte> read_property(X11Connection& x, xcb_atom_t* type_out) {
 
 // ====== Copy ============================================================
 
-bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
-                      CopyData data, bool oneshot) {
+namespace {
+
+// Everything we need to keep alive across the fork boundary in the
+// xclip-style "acquire-then-detach" flow.
+struct CopyContext {
+    X11Connection     x;
+    AdvertisedTargets targets;
+    xcb_atom_t        selatom = XCB_ATOM_NONE;
+    CopyData          data;
+};
+
+// Phase 1: open connection, build TARGETS list, acquire and verify selection
+// ownership. Must complete *before* the parent process exits in detached mode,
+// so that outside observers (e.g. Xwayland → wayland compositor) can already
+// see the new X11 owner by the time the shell command returns.
+bool acquire_selection(const std::string& display, Selection sel,
+                       CopyData&& data, CopyContext& ctx) {
     if (data.mime_types.empty()) {
         spdlog::error("x11 copy: no MIME types");
         return false;
     }
-    X11Connection x;
-    if (!x.open(display_)) return false;
+    if (!ctx.x.open(display)) return false;
 
-    xcb_atom_t selatom = selection_atom(x.atoms, sel);
-    AdvertisedTargets targets = build_targets(x.conn, x.atoms, data.mime_types);
+    ctx.selatom = selection_atom(ctx.x.atoms, sel);
+    ctx.targets = build_targets(ctx.x.conn, ctx.x.atoms, data.mime_types);
 
-    x.owner_time = acquire_server_time(x);
-    xcb_set_selection_owner(x.conn, x.window, selatom, x.owner_time);
-    xcb_flush(x.conn);
+    ctx.x.owner_time = acquire_server_time(ctx.x);
+    xcb_set_selection_owner(ctx.x.conn, ctx.x.window, ctx.selatom,
+                            ctx.x.owner_time);
+    xcb_flush(ctx.x.conn);
 
-    auto own_c = xcb_get_selection_owner(x.conn, selatom);
-    auto* own_r = xcb_get_selection_owner_reply(x.conn, own_c, nullptr);
-    if (!own_r || own_r->owner != x.window) {
+    auto own_c = xcb_get_selection_owner(ctx.x.conn, ctx.selatom);
+    auto* own_r = xcb_get_selection_owner_reply(ctx.x.conn, own_c, nullptr);
+    if (!own_r || own_r->owner != ctx.x.window) {
         spdlog::error("x11 copy: failed to become selection owner");
         if (own_r) std::free(own_r);
         return false;
@@ -357,8 +376,20 @@ bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
                  sel == Selection::Primary ? "PRIMARY" : "CLIPBOARD",
                  data.mime_types.size());
 
-    int served = 0;
-    bool lost = false;
+    ctx.data = std::move(data);
+    return true;
+}
+
+// Phase 2: block in the X event loop, answering SelectionRequests until we
+// lose ownership (or until oneshot mode serves one consumer and exits).
+bool serve_selection(CopyContext& ctx, bool oneshot) {
+    auto&       x       = ctx.x;
+    const auto& targets = ctx.targets;
+    const auto& data    = ctx.data;
+    const auto  selatom = ctx.selatom;
+
+    int  served = 0;
+    bool lost   = false;
     while (!lost) {
         xcb_flush(x.conn);
         auto* ev = xcb_wait_for_event(x.conn);
@@ -424,6 +455,51 @@ bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
         }
     }
     return served > 0 || !lost;
+}
+
+}  // namespace
+
+bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
+                      CopyData data, bool oneshot) {
+    // No fork — caller (or the test harness) decides lifecycle.
+    return copy_acquire_then_detach(sel, std::move(data), oneshot,
+                                    /*detach=*/false);
+}
+
+bool X11Backend::copy_acquire_then_detach(Selection sel, CopyData data,
+                                          bool oneshot, bool detach) {
+    CopyContext ctx;
+    if (!acquire_selection(display_, sel, std::move(data), ctx)) {
+        return false;
+    }
+
+    if (detach) {
+        // Match xclip's flow: ownership is acquired+verified in the parent,
+        // *then* fork. The shell sees the command return only after Xwayland
+        // and the compositor can already see the new X11 owner.
+        pid_t pid = ::fork();
+        if (pid < 0) {
+            spdlog::error("fork() failed: {}", std::strerror(errno));
+            return false;
+        }
+        if (pid > 0) {
+            // Parent: bail out without unwinding. The X11Connection destructor
+            // would xcb_destroy_window (releasing ownership we just took) and
+            // xcb_disconnect (closing the shared X socket). _exit skips all
+            // C++ destructors and atexit handlers — this is what xclip does.
+            ::_exit(0);
+        }
+        // Child becomes the daemon.
+        ::setsid();
+        int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+            ::dup2(devnull, STDOUT_FILENO);
+            if (devnull > 2) ::close(devnull);
+        }
+    }
+
+    return serve_selection(ctx, oneshot);
 }
 
 // ====== Paste ===========================================================

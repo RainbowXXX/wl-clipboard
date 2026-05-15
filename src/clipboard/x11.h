@@ -35,6 +35,18 @@ public:
                const std::string& prefer_mime, bool list_only,
                PasteResult& out) override;
 
+    // Two-phase copy that matches xclip's lifecycle:
+    //   * acquire+verify selection ownership in the caller process
+    //   * then fork; the parent exits (so shell sees the command return only
+    //     after Xwayland/compositor can already see the new X11 owner) and
+    //     the child stays around to serve SelectionRequests.
+    // This is *significantly* faster from the perspective of an outside
+    // observer polling the clipboard, because the bridge propagation can
+    // start at "shell-return - epsilon" instead of "shell-return + 100-200ms"
+    // (which is what happens if the caller daemonizes before doing any X).
+    bool copy_acquire_then_detach(Selection sel, CopyData data,
+                                  bool oneshot, bool detach);
+
 private:
     std::string display_;
 };
