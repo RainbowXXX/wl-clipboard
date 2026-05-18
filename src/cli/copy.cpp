@@ -208,7 +208,12 @@ bool wait_for_wl_visibility(
         [](void* data, zwlr_data_control_offer_v1* proxy, const char* mime) {
             auto* s = static_cast<SyncState*>(data);
             for (auto& o : s->offers) {
-                if (o->proxy == proxy) { o->mimes.emplace_back(mime); return; }
+                if (o->proxy == proxy) {
+                    o->mimes.emplace_back(mime);
+                    spdlog::info("[x11 sync trace] offer {} +mime '{}'",
+                                 static_cast<void*>(proxy), mime);
+                    return;
+                }
             }
         },
     };
@@ -222,6 +227,8 @@ bool wait_for_wl_visibility(
             r->proxy = p;
             zwlr_data_control_offer_v1_add_listener(p, &offer_listener, s);
             s->offers.push_back(std::move(r));
+            spdlog::info("[x11 sync trace] new data_offer {}",
+                         static_cast<void*>(p));
         },
         // selection
         [](void* data, zwlr_data_control_device_v1*,
@@ -229,21 +236,31 @@ bool wait_for_wl_visibility(
             auto* s = static_cast<SyncState*>(data);
             s->current_regular = p;
             s->fresh_regular = true;
+            spdlog::info("[x11 sync trace] selection event -> offer={}",
+                         static_cast<void*>(p));
         },
         // finished
-        [](void*, zwlr_data_control_device_v1*) {},
+        [](void*, zwlr_data_control_device_v1*) {
+            spdlog::info("[x11 sync trace] device finished");
+        },
         // primary_selection
         [](void* data, zwlr_data_control_device_v1*,
            zwlr_data_control_offer_v1* p) {
             auto* s = static_cast<SyncState*>(data);
             s->current_primary = p;
             s->fresh_primary = true;
+            spdlog::info("[x11 sync trace] primary_selection event -> offer={}",
+                         static_cast<void*>(p));
         },
     };
 
     auto* device = zwlr_data_control_manager_v1_get_data_device(mgr, seat->proxy);
     zwlr_data_control_device_v1_add_listener(device, &device_listener, &st);
     ws.flush();
+    spdlog::info("[x11 sync trace] device created, listener attached; "
+                 "my_mimes=[{}] my_bytes={} primary={}",
+                 [&]{ std::string s; for (auto& m : my_mimes) { if(!s.empty())s+=","; s+=m; } return s; }(),
+                 my_bytes.size(), primary);
 
     int fd = wl_display_get_fd(ws.display());
 
@@ -253,48 +270,68 @@ bool wait_for_wl_visibility(
         auto& fresh   = primary ? st.fresh_primary   : st.fresh_regular;
         auto*& current = primary ? st.current_primary : st.current_regular;
 
-        if (!fresh) return 0;
-        fresh = false;  // consume the edge
+        if (!fresh) {
+            spdlog::info("[x11 sync trace] try_match: no fresh selection event");
+            return 0;
+        }
+        fresh = false;
+        spdlog::info("[x11 sync trace] try_match: fresh={} current={}",
+                     true, static_cast<void*>(current));
 
-        if (!current) return 0;  // selection was cleared, not ours
+        if (!current) return 0;
 
         OfferRec* offer = nullptr;
         for (auto& o : st.offers) {
             if (o->proxy == current) { offer = o.get(); break; }
         }
-        if (!offer) return 0;
+        if (!offer) {
+            spdlog::info("[x11 sync trace] try_match: current offer {} "
+                         "not in offers list (n={})",
+                         static_cast<void*>(current), st.offers.size());
+            return 0;
+        }
 
-        // Pick the first MIME we'd advertised that the offer also carries.
+        std::string offered_str;
+        for (auto& m : offer->mimes) { if(!offered_str.empty()) offered_str+=","; offered_str+=m; }
+        spdlog::info("[x11 sync trace] try_match: offer has [{}]", offered_str);
+
         std::string mime;
         for (const auto& m : my_mimes) {
             if (std::find(offer->mimes.begin(), offer->mimes.end(), m)
                 != offer->mimes.end()) { mime = m; break; }
         }
-        if (mime.empty()) return 0;  // not the new owner's offer
+        if (mime.empty()) {
+            spdlog::info("[x11 sync trace] try_match: no MIME overlap, skip");
+            return 0;
+        }
+        spdlog::info("[x11 sync trace] try_match: receive '{}' ...", mime);
 
-        // receive() and compare bytes — the only way to distinguish "stale
-        // offer that happens to share our MIMEs" from "our offer just
-        // surfaced". The receive round-trips compositor -> Xwayland ->
-        // ConvertSelection -> child serve, ~5-15ms typical.
         auto pipe = core::make_pipe();
         if (!pipe.read_end || !pipe.write_end) return -1;
         zwlr_data_control_offer_v1_receive(offer->proxy, mime.c_str(),
                                            pipe.write_end.get());
         ws.flush();
         pipe.write_end.reset();
+        auto t_recv = clock::now();
         auto got = core::drain_fd(pipe.read_end.get());
+        auto recv_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           clock::now() - t_recv).count();
+        spdlog::info("[x11 sync trace] try_match: drained {} bytes in {} ms",
+                     got.size(), recv_ms);
         if (got.size() == my_bytes.size() &&
             (my_bytes.empty() ||
              std::memcmp(got.data(), my_bytes.data(), got.size()) == 0)) {
             return 1;
         }
-        return 0;  // stale, wait for next selection event
+        spdlog::info("[x11 sync trace] try_match: byte mismatch (got={} want={})",
+                     got.size(), my_bytes.size());
+        return 0;
     };
 
-    // Drain whatever's already queued so the initial selection (which the
-    // compositor sends synchronously on get_data_device) is processed before
-    // we start blocking on poll().
     ws.roundtrip();
+    spdlog::info("[x11 sync trace] post-roundtrip: offers={} fresh_reg={} cur_reg={}",
+                 st.offers.size(), st.fresh_regular,
+                 static_cast<void*>(st.current_regular));
     bool verified = (try_match() == 1);
 
     while (!verified) {
@@ -303,8 +340,12 @@ bool wait_for_wl_visibility(
         ws.flush();
         pollfd pfd{fd, POLLIN, 0};
         int r = ::poll(&pfd, 1, rem);
-        if (r <= 0) break;  // 0 = timeout, -1 = error
-        if (wl_display_dispatch(ws.display()) < 0) break;
+        if (r == 0) { spdlog::info("[x11 sync trace] poll timeout, rem was {}", rem); break; }
+        if (r < 0)  { spdlog::info("[x11 sync trace] poll error errno={}", errno); break; }
+        if (wl_display_dispatch(ws.display()) < 0) {
+            spdlog::info("[x11 sync trace] dispatch error");
+            break;
+        }
         int m = try_match();
         if (m == 1) { verified = true; break; }
         if (m < 0)  break;
