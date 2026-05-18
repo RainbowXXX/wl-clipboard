@@ -59,15 +59,31 @@ std::string atom_name(xcb_connection_t* c, xcb_atom_t atom) {
     return s;
 }
 
+// Batch all InternAtom requests before collecting any reply. XCB pipelines
+// the cookies into one server write and we pay a single round-trip for the
+// whole set instead of one per atom (8 -> 1 on the copy critical path).
 void load_atoms(xcb_connection_t* c, Atoms& a) {
-    a.CLIPBOARD    = intern_atom(c, "CLIPBOARD");
-    a.TARGETS      = intern_atom(c, "TARGETS");
-    a.TIMESTAMP    = intern_atom(c, "TIMESTAMP");
-    a.MULTIPLE     = intern_atom(c, "MULTIPLE");
-    a.INCR         = intern_atom(c, "INCR");
-    a.UTF8_STRING  = intern_atom(c, "UTF8_STRING");
-    a.TEXT         = intern_atom(c, "TEXT");
-    a.WL_SELECTION = intern_atom(c, "WLCLIP_SELECTION");
+    struct Pending { xcb_atom_t* slot; xcb_intern_atom_cookie_t cookie; };
+    auto send = [&](xcb_atom_t* slot, std::string_view name) {
+        return Pending{slot,
+            xcb_intern_atom(c, 0, static_cast<std::uint16_t>(name.size()),
+                            name.data())};
+    };
+    Pending pending[] = {
+        send(&a.CLIPBOARD,    "CLIPBOARD"),
+        send(&a.TARGETS,      "TARGETS"),
+        send(&a.TIMESTAMP,    "TIMESTAMP"),
+        send(&a.MULTIPLE,     "MULTIPLE"),
+        send(&a.INCR,         "INCR"),
+        send(&a.UTF8_STRING,  "UTF8_STRING"),
+        send(&a.TEXT,         "TEXT"),
+        send(&a.WL_SELECTION, "WLCLIP_SELECTION"),
+    };
+    for (auto& p : pending) {
+        auto* reply = xcb_intern_atom_reply(c, p.cookie, nullptr);
+        *p.slot = reply ? reply->atom : XCB_ATOM_NONE;
+        std::free(reply);
+    }
 }
 
 xcb_atom_t selection_atom(const Atoms& a, Selection sel) {
@@ -134,6 +150,16 @@ struct AdvertisedTargets {
 AdvertisedTargets build_targets(xcb_connection_t* c, const Atoms& a,
                                 const std::vector<std::string>& mimes) {
     AdvertisedTargets t;
+
+    // Pipeline all MIME atom interns first, then collect replies in order.
+    // Same trick as load_atoms: N sequential round-trips -> 1.
+    std::vector<xcb_intern_atom_cookie_t> cookies;
+    cookies.reserve(mimes.size());
+    for (const auto& m : mimes) {
+        cookies.push_back(xcb_intern_atom(
+            c, 0, static_cast<std::uint16_t>(m.size()), m.data()));
+    }
+
     auto add = [&](xcb_atom_t atom, std::string name) {
         if (atom == XCB_ATOM_NONE) return;
         if (std::find(t.atoms.begin(), t.atoms.end(), atom) != t.atoms.end()) return;
@@ -143,9 +169,13 @@ AdvertisedTargets build_targets(xcb_connection_t* c, const Atoms& a,
     add(a.TARGETS,   "TARGETS");
     add(a.TIMESTAMP, "TIMESTAMP");
     bool has_text = false;
-    for (const auto& m : mimes) {
+    for (std::size_t i = 0; i < mimes.size(); ++i) {
+        const auto& m = mimes[i];
         if (core::is_textual(m)) has_text = true;
-        add(intern_atom(c, m), m);
+        auto* reply = xcb_intern_atom_reply(c, cookies[i], nullptr);
+        xcb_atom_t atom = reply ? reply->atom : XCB_ATOM_NONE;
+        std::free(reply);
+        add(atom, m);
     }
     if (has_text) {
         add(a.UTF8_STRING, "UTF8_STRING");
