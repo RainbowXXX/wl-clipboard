@@ -36,6 +36,7 @@ struct Atoms {
     xcb_atom_t STRING        = XCB_ATOM_STRING;
     xcb_atom_t TEXT          = XCB_ATOM_NONE;
     xcb_atom_t WL_SELECTION  = XCB_ATOM_NONE;  // private property for receive
+    xcb_atom_t NET_WM_NAME   = XCB_ATOM_NONE;  // used by describe_window logging
 };
 
 xcb_atom_t intern_atom(xcb_connection_t* c, std::string_view name) {
@@ -78,6 +79,7 @@ void load_atoms(xcb_connection_t* c, Atoms& a) {
         send(&a.UTF8_STRING,  "UTF8_STRING"),
         send(&a.TEXT,         "TEXT"),
         send(&a.WL_SELECTION, "WLCLIP_SELECTION"),
+        send(&a.NET_WM_NAME,  "_NET_WM_NAME"),
     };
     for (auto& p : pending) {
         auto* reply = xcb_intern_atom_reply(c, p.cookie, nullptr);
@@ -207,10 +209,24 @@ std::string match_target(const AdvertisedTargets& t,
 
 // Look up "WM_CLASS" (or fall back to "_NET_WM_NAME"/"WM_NAME") of a window
 // so we can label the requester in logs. Returns "0x<id>" if nothing found.
-std::string describe_window(xcb_connection_t* c, xcb_window_t w) {
-    auto fetch = [&](xcb_atom_t prop, xcb_atom_t type, std::uint32_t max_words) {
+//
+// Hot-path constraints:
+//  - Caller must invoke this AFTER the SelectionNotify has been flushed, never
+//    before. Each round-trip here would otherwise block the requestor.
+//  - Atoms are all known up front (predefined or pre-interned in load_atoms),
+//    so zero InternAtom round-trips.
+//  - The three GetProperty requests are pipelined: send all cookies, then
+//    collect replies — one round-trip for all three instead of up to three.
+std::string describe_window(xcb_connection_t* c, const Atoms& a, xcb_window_t w) {
+    auto class_cookie = xcb_get_property(c, 0, w, XCB_ATOM_WM_CLASS,
+                                         XCB_ATOM_STRING, 0, 64);
+    auto net_cookie   = xcb_get_property(c, 0, w, a.NET_WM_NAME,
+                                         a.UTF8_STRING, 0, 64);
+    auto name_cookie  = xcb_get_property(c, 0, w, XCB_ATOM_WM_NAME,
+                                         XCB_ATOM_STRING, 0, 64);
+
+    auto take = [&](xcb_get_property_cookie_t cookie) -> std::string {
         std::string out;
-        auto cookie = xcb_get_property(c, 0, w, prop, type, 0, max_words);
         auto* reply = xcb_get_property_reply(c, cookie, nullptr);
         if (!reply) return out;
         int len = xcb_get_property_value_length(reply);
@@ -221,26 +237,26 @@ std::string describe_window(xcb_connection_t* c, xcb_window_t w) {
         std::free(reply);
         return out;
     };
+
     // WM_CLASS is two NUL-separated strings: instance \0 class \0
-    std::string wm_class = fetch(intern_atom(c, "WM_CLASS"), XCB_ATOM_STRING, 64);
+    std::string wm_class = take(class_cookie);
+    std::string net_name = take(net_cookie);
+    std::string wm_name  = take(name_cookie);
+
     if (!wm_class.empty()) {
         auto sep = wm_class.find('\0');
         std::string inst = wm_class.substr(0, sep);
         std::string cls  = (sep != std::string::npos)
                          ? wm_class.substr(sep + 1)
                          : std::string();
-        // strip trailing NUL chars
-        while (!cls.empty() && cls.back() == '\0') cls.pop_back();
+        while (!cls.empty()  && cls.back()  == '\0') cls.pop_back();
         while (!inst.empty() && inst.back() == '\0') inst.pop_back();
         if (!cls.empty() || !inst.empty()) {
             return cls.empty() ? inst : (inst.empty() ? cls : inst + "/" + cls);
         }
     }
-    std::string net_name = fetch(intern_atom(c, "_NET_WM_NAME"),
-                                 intern_atom(c, "UTF8_STRING"), 64);
     if (!net_name.empty()) return net_name;
-    std::string wm_name = fetch(XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 64);
-    if (!wm_name.empty()) return wm_name;
+    if (!wm_name.empty())  return wm_name;
     char buf[24];
     std::snprintf(buf, sizeof(buf), "0x%x", w);
     return buf;
@@ -432,14 +448,33 @@ bool serve_selection(CopyContext& ctx, bool oneshot) {
         std::uint8_t t = ev->response_type & ~0x80;
 
         if (t == XCB_SELECTION_REQUEST) {
+            // Stopwatch covers everything the requestor (Xwayland) is blocked
+            // on: from the moment we picked the SelectionRequest up off the
+            // socket until our SelectionNotify is flushed back. This is the
+            // number to watch when chasing copy->paste latency.
+            auto req_start = std::chrono::steady_clock::now();
+
             auto* req = reinterpret_cast<xcb_selection_request_event_t*>(ev);
             if (req->selection != selatom) {
                 send_selection_notify(x.conn, req, XCB_ATOM_NONE);
+                xcb_flush(x.conn);
+                auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - req_start).count();
+                spdlog::info("[x11] refused foreign selection in {}.{:03} ms",
+                             us / 1000, us % 1000);
                 continue;
             }
             xcb_atom_t prop = req->property ? req->property : req->target;
 
-            std::string who = describe_window(x.conn, req->requestor);
+            // ---- Phase A: build and send the response IMMEDIATELY ----
+            // Anything that needs an X round-trip (atom_name / describe_window)
+            // is deferred to Phase B. Doing logging first would stall the
+            // requestor (Xwayland) for the whole duration of those round-trips
+            // — which is what makes a wlclip paste appear ~150ms slower than
+            // xclip in end-to-end timings.
+            enum class Kind { Targets, Timestamp, Served, Refused };
+            Kind        kind;
+            std::string served_mime;
 
             if (req->target == x.atoms.TARGETS) {
                 xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
@@ -447,22 +482,20 @@ bool serve_selection(CopyContext& ctx, bool oneshot) {
                                     static_cast<std::uint32_t>(targets.atoms.size()),
                                     targets.atoms.data());
                 send_selection_notify(x.conn, req, prop);
-                spdlog::info("[x11] TARGETS queried by '{}' (win 0x{:x})",
-                             who, req->requestor);
+                kind = Kind::Targets;
             } else if (req->target == x.atoms.TIMESTAMP) {
                 std::uint32_t ts = x.owner_time;
                 xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
                                     req->requestor, prop, XCB_ATOM_INTEGER, 32,
                                     1, &ts);
                 send_selection_notify(x.conn, req, prop);
-                spdlog::debug("[x11] TIMESTAMP queried by '{}'", who);
+                kind = Kind::Timestamp;
             } else {
-                std::string mime = match_target(targets, data.mime_types,
-                                                req->target, x.atoms);
-                if (mime.empty()) {
-                    spdlog::info("[x11] refused target '{}' from '{}' (win 0x{:x})",
-                                 atom_name(x.conn, req->target), who, req->requestor);
+                served_mime = match_target(targets, data.mime_types,
+                                           req->target, x.atoms);
+                if (served_mime.empty()) {
                     send_selection_notify(x.conn, req, XCB_ATOM_NONE);
+                    kind = Kind::Refused;
                 } else {
                     xcb_change_property(x.conn, XCB_PROP_MODE_REPLACE,
                                         req->requestor, prop, req->target, 8,
@@ -470,15 +503,59 @@ bool serve_selection(CopyContext& ctx, bool oneshot) {
                                         data.bytes.data());
                     send_selection_notify(x.conn, req, prop);
                     served++;
-                    spdlog::info("[x11] clipboard fetched by '{}' (win 0x{:x}): "
-                                 "mime='{}' target='{}' bytes={} (served #{})",
-                                 who, req->requestor, mime,
-                                 atom_name(x.conn, req->target),
-                                 data.bytes.size(), served);
                     if (oneshot) lost = true;
+                    kind = Kind::Served;
                 }
             }
-            xcb_flush(x.conn);
+            xcb_flush(x.conn);  // <-- requestor unblocked here
+            auto req_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - req_start).count();
+            // ms.us as integer pair so the format is "12.345 ms" without
+            // pulling in floating-point or locale.
+            long long ms_part = req_us / 1000;
+            long long us_part = req_us % 1000;
+
+            // ---- Phase B: logging only, all expensive XCB calls live here ----
+            const bool want_info  = spdlog::should_log(spdlog::level::info);
+            const bool want_debug = spdlog::should_log(spdlog::level::debug);
+            switch (kind) {
+            case Kind::Targets:
+                if (want_info) {
+                    spdlog::info("[x11] TARGETS queried by '{}' (win 0x{:x}) "
+                                 "served in {}.{:03} ms",
+                                 describe_window(x.conn, x.atoms, req->requestor),
+                                 req->requestor, ms_part, us_part);
+                }
+                break;
+            case Kind::Timestamp:
+                if (want_debug) {
+                    spdlog::debug("[x11] TIMESTAMP queried by '{}' "
+                                  "served in {}.{:03} ms",
+                                  describe_window(x.conn, x.atoms, req->requestor),
+                                  ms_part, us_part);
+                }
+                break;
+            case Kind::Refused:
+                if (want_info) {
+                    spdlog::info("[x11] refused target '{}' from '{}' (win 0x{:x}) "
+                                 "in {}.{:03} ms",
+                                 atom_name(x.conn, req->target),
+                                 describe_window(x.conn, x.atoms, req->requestor),
+                                 req->requestor, ms_part, us_part);
+                }
+                break;
+            case Kind::Served:
+                if (want_info) {
+                    spdlog::info("[x11] clipboard fetched by '{}' (win 0x{:x}): "
+                                 "mime='{}' target='{}' bytes={} (served #{}) "
+                                 "in {}.{:03} ms",
+                                 describe_window(x.conn, x.atoms, req->requestor),
+                                 req->requestor, served_mime,
+                                 atom_name(x.conn, req->target),
+                                 data.bytes.size(), served, ms_part, us_part);
+                }
+                break;
+            }
         } else if (t == XCB_SELECTION_CLEAR) {
             spdlog::debug("x11: selection cleared (served={})", served);
             lost = true;
