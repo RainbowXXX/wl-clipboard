@@ -126,16 +126,29 @@ struct X11Connection {
         }
         load_atoms(conn, atoms);
 
-        // Unmapped 1x1 InputOnly window — never visible, legal owner/requestor.
+        // Unmapped 1x1 InputOutput window — never visible, but matches what
+        // xclip creates with XCreateSimpleWindow. We tried InputOnly first
+        // (legal per ICCCM and lighter) but measured 150ms+ extra latency
+        // before the new selection actually became visible to wl-paste on
+        // KDE/Plasma — klipper / kwin's X-W bridge appear to treat InputOnly
+        // owners as utility windows and add a debounce. InputOutput pretends
+        // to be a real app and goes through the fast path.
         window = xcb_generate_id(conn);
         std::uint32_t mask = XCB_CW_EVENT_MASK;
         std::uint32_t values[] = {XCB_EVENT_MASK_PROPERTY_CHANGE};
         xcb_create_window(conn, XCB_COPY_FROM_PARENT,
                           window, screen->root,
                           0, 0, 1, 1, 0,
-                          XCB_WINDOW_CLASS_INPUT_ONLY,
+                          XCB_WINDOW_CLASS_INPUT_OUTPUT,
                           XCB_COPY_FROM_PARENT,
                           mask, values);
+        // Set WM_CLASS for the same reason as InputOutput above: clipboard
+        // managers filter on it. Format is instance\0class\0 (NOT NUL-terminated
+        // at the end — the length field tells the server where to stop).
+        static const char kWmClass[] = "wlclip\0wlclip";
+        xcb_change_property(conn, XCB_PROP_MODE_REPLACE, window,
+                            XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8,
+                            sizeof(kWmClass) - 1, kWmClass);
         xcb_flush(conn);
         spdlog::debug("x11: connected, window=0x{:x}", window);
         return true;
@@ -262,31 +275,6 @@ std::string describe_window(xcb_connection_t* c, const Atoms& a, xcb_window_t w)
     return buf;
 }
 
-// Acquire a real server timestamp by triggering a zero-length PropertyNotify
-// on our own window. ICCCM §2.1/§2.6.2 require the SetSelectionOwner time and
-// the TIMESTAMP target reply to be a real server time, not CurrentTime (0).
-// Some compositors (notably kwin/xwayland) treat a 0 timestamp as suspicious
-// and add an internal debounce/verification delay (~150ms+) before propagating
-// the X11 selection to Wayland clients. Returning a real time eliminates that.
-xcb_timestamp_t acquire_server_time(X11Connection& x) {
-    xcb_change_property(x.conn, XCB_PROP_MODE_APPEND, x.window,
-                        XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, 0, nullptr);
-    xcb_flush(x.conn);
-    while (auto* ev = xcb_wait_for_event(x.conn)) {
-        std::unique_ptr<xcb_generic_event_t, decltype(&std::free)>
-            guard(ev, &std::free);
-        if ((ev->response_type & ~0x80) == XCB_PROPERTY_NOTIFY) {
-            auto* pn = reinterpret_cast<xcb_property_notify_event_t*>(ev);
-            if (pn->window == x.window && pn->atom == XCB_ATOM_WM_NAME) {
-                return pn->time;
-            }
-        }
-        // Drop any other events; the window is brand-new and unmapped, so
-        // nothing else is expected here.
-    }
-    return XCB_CURRENT_TIME;
-}
-
 void send_selection_notify(xcb_connection_t* c,
                            xcb_selection_request_event_t* req,
                            xcb_atom_t prop) {
@@ -405,9 +393,17 @@ bool acquire_selection(const std::string& display, Selection sel,
     ctx.selatom = selection_atom(ctx.x.atoms, sel);
     ctx.targets = build_targets(ctx.x.conn, ctx.x.atoms, data.mime_types);
 
-    ctx.x.owner_time = acquire_server_time(ctx.x);
+    // Use CurrentTime to mirror xclip exactly. We previously fetched a real
+    // server timestamp via a PropertyNotify trick, intending to dodge a
+    // hypothetical "time == 0" debounce in some compositors — measurements on
+    // KDE/Plasma showed the opposite: CurrentTime takes the fast path and the
+    // real-timestamp path adds ~150ms to the time the new selection becomes
+    // visible to wl-paste. ICCCM §2.1 prefers a real time but xclip has shipped
+    // with CurrentTime forever; we match that. The TIMESTAMP target reply will
+    // be 0, which all observed consumers (Xwayland, klipper, kwin) tolerate.
+    ctx.x.owner_time = XCB_CURRENT_TIME;
     xcb_set_selection_owner(ctx.x.conn, ctx.x.window, ctx.selatom,
-                            ctx.x.owner_time);
+                            XCB_CURRENT_TIME);
     xcb_flush(ctx.x.conn);
 
     auto own_c = xcb_get_selection_owner(ctx.x.conn, ctx.selatom);
