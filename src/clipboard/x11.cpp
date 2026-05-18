@@ -127,12 +127,18 @@ struct X11Connection {
         load_atoms(conn, atoms);
 
         // Unmapped 1x1 InputOutput window — never visible, but matches what
-        // xclip creates with XCreateSimpleWindow. We tried InputOnly first
-        // (legal per ICCCM and lighter) but measured 150ms+ extra latency
-        // before the new selection actually became visible to wl-paste on
+        // xclip creates with XCreateSimpleWindow. Tried InputOnly first
+        // (legal per ICCCM and lighter) but measured ~150ms extra latency on
         // KDE/Plasma — klipper / kwin's X-W bridge appear to treat InputOnly
-        // owners as utility windows and add a debounce. InputOutput pretends
-        // to be a real app and goes through the fast path.
+        // owners as utility windows and add a debounce.
+        //
+        // We DO NOT set WM_CLASS, WM_NAME, _NET_WM_PID, etc. xclip leaves the
+        // window completely anonymous, and matching that exactly is what gets
+        // klipper to promote the new X selection to the wayland data_control
+        // device on the fast path. Setting WM_CLASS="wlclip" was measured to
+        // add ~80ms to copy-to-paste latency on KDE — speculation: klipper
+        // recognises a named owner as "a real wayland-aware tool, wait for it
+        // to publish wayland selection itself" and debounces accordingly.
         window = xcb_generate_id(conn);
         std::uint32_t mask = XCB_CW_EVENT_MASK;
         std::uint32_t values[] = {XCB_EVENT_MASK_PROPERTY_CHANGE};
@@ -142,13 +148,6 @@ struct X11Connection {
                           XCB_WINDOW_CLASS_INPUT_OUTPUT,
                           XCB_COPY_FROM_PARENT,
                           mask, values);
-        // Set WM_CLASS for the same reason as InputOutput above: clipboard
-        // managers filter on it. Format is instance\0class\0 (NOT NUL-terminated
-        // at the end — the length field tells the server where to stop).
-        static const char kWmClass[] = "wlclip\0wlclip";
-        xcb_change_property(conn, XCB_PROP_MODE_REPLACE, window,
-                            XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8,
-                            sizeof(kWmClass) - 1, kWmClass);
         xcb_flush(conn);
         spdlog::debug("x11: connected, window=0x{:x}", window);
         return true;
