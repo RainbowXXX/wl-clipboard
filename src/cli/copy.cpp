@@ -264,47 +264,32 @@ bool wait_for_wl_visibility(
 
     int fd = wl_display_get_fd(ws.display());
 
-    // Returns 1 = matched, 0 = not yet (selection slot is stale or empty),
-    // -1 = hard error.
-    auto try_match = [&]() -> int {
-        auto& fresh   = primary ? st.fresh_primary   : st.fresh_regular;
+    // Probe the *current* selection offer: receive() its bytes and compare.
+    // Returns 1=match, 0=mismatch-or-not-yet, -1=hard fail.
+    //
+    // We do NOT gate this on a "fresh selection event" anymore. Reason:
+    // dde-clipboard (and likely klipper too) keeps the same wayland source
+    // object across X-side selection changes. When the X selection changes,
+    // dde-clipboard updates its INTERNAL cache but does NOT re-call
+    // set_selection on wlr_data_control, so wayland clients never receive a
+    // new selection event. The only way to observe the cache refresh is to
+    // re-receive() on the same offer and compare bytes.
+    auto probe_current_offer = [&]() -> int {
         auto*& current = primary ? st.current_primary : st.current_regular;
-
-        if (!fresh) {
-            spdlog::info("[x11 sync trace] try_match: no fresh selection event");
-            return 0;
-        }
-        fresh = false;
-        spdlog::info("[x11 sync trace] try_match: fresh={} current={}",
-                     true, static_cast<void*>(current));
-
         if (!current) return 0;
 
         OfferRec* offer = nullptr;
         for (auto& o : st.offers) {
             if (o->proxy == current) { offer = o.get(); break; }
         }
-        if (!offer) {
-            spdlog::info("[x11 sync trace] try_match: current offer {} "
-                         "not in offers list (n={})",
-                         static_cast<void*>(current), st.offers.size());
-            return 0;
-        }
-
-        std::string offered_str;
-        for (auto& m : offer->mimes) { if(!offered_str.empty()) offered_str+=","; offered_str+=m; }
-        spdlog::info("[x11 sync trace] try_match: offer has [{}]", offered_str);
+        if (!offer) return 0;
 
         std::string mime;
         for (const auto& m : my_mimes) {
             if (std::find(offer->mimes.begin(), offer->mimes.end(), m)
                 != offer->mimes.end()) { mime = m; break; }
         }
-        if (mime.empty()) {
-            spdlog::info("[x11 sync trace] try_match: no MIME overlap, skip");
-            return 0;
-        }
-        spdlog::info("[x11 sync trace] try_match: receive '{}' ...", mime);
+        if (mime.empty()) return 0;
 
         auto pipe = core::make_pipe();
         if (!pipe.read_end || !pipe.write_end) return -1;
@@ -316,39 +301,60 @@ bool wait_for_wl_visibility(
         auto got = core::drain_fd(pipe.read_end.get());
         auto recv_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                            clock::now() - t_recv).count();
-        spdlog::info("[x11 sync trace] try_match: drained {} bytes in {} ms",
-                     got.size(), recv_ms);
-        if (got.size() == my_bytes.size() &&
-            (my_bytes.empty() ||
-             std::memcmp(got.data(), my_bytes.data(), got.size()) == 0)) {
-            return 1;
-        }
-        spdlog::info("[x11 sync trace] try_match: byte mismatch (got={} want={})",
-                     got.size(), my_bytes.size());
-        return 0;
+        bool ok = (got.size() == my_bytes.size()) &&
+                  (my_bytes.empty() ||
+                   std::memcmp(got.data(), my_bytes.data(), got.size()) == 0);
+        spdlog::debug("[x11 sync trace] probe offer={} mime='{}' got={}b "
+                      "want={}b in {}ms -> {}",
+                      static_cast<void*>(offer->proxy), mime,
+                      got.size(), my_bytes.size(), recv_ms,
+                      ok ? "MATCH" : "stale");
+        return ok ? 1 : 0;
     };
 
+    // Drain initial state: the get_data_device call above causes the
+    // compositor to synchronously enumerate the current offers + selection
+    // before we start polling.
     ws.roundtrip();
-    spdlog::info("[x11 sync trace] post-roundtrip: offers={} fresh_reg={} cur_reg={}",
-                 st.offers.size(), st.fresh_regular,
-                 static_cast<void*>(st.current_regular));
-    bool verified = (try_match() == 1);
+    spdlog::debug("[x11 sync trace] post-roundtrip: offers={} cur_reg={} cur_pri={}",
+                  st.offers.size(),
+                  static_cast<void*>(st.current_regular),
+                  static_cast<void*>(st.current_primary));
 
+    // Probe-retry loop. Each iteration: probe the current offer, then either
+    // declare match or wait briefly for events / time for the source's cache
+    // to refresh. We retry even WITHOUT a wayland event — clipboard
+    // managers tend to update an existing source's cache silently when the
+    // X selection changes underneath, which we can only detect by another
+    // receive().
+    //
+    // Per-iteration cost: ~5-15ms (one receive + drain round-trip) +
+    // up to `probe_interval_ms` waiting. With ~30ms interval and 500ms
+    // budget that's ~10-12 probes, plenty to catch the cache refresh.
+    constexpr int probe_interval_ms = 30;
+    bool verified = false;
     while (!verified) {
+        int r = probe_current_offer();
+        if (r == 1) { verified = true; break; }
+        if (r < 0)  break;
+
         int rem = remaining_ms();
         if (rem <= 0) break;
+
+        // Wait up to probe_interval_ms for an event; if none, fall through
+        // and probe again anyway.
+        int wait_ms = std::min(probe_interval_ms, rem);
         ws.flush();
         pollfd pfd{fd, POLLIN, 0};
-        int r = ::poll(&pfd, 1, rem);
-        if (r == 0) { spdlog::info("[x11 sync trace] poll timeout, rem was {}", rem); break; }
-        if (r < 0)  { spdlog::info("[x11 sync trace] poll error errno={}", errno); break; }
-        if (wl_display_dispatch(ws.display()) < 0) {
-            spdlog::info("[x11 sync trace] dispatch error");
-            break;
+        int p = ::poll(&pfd, 1, wait_ms);
+        if (p < 0)  { spdlog::debug("[x11 sync trace] poll errno={}", errno); break; }
+        if (p > 0) {
+            if (wl_display_dispatch(ws.display()) < 0) {
+                spdlog::debug("[x11 sync trace] dispatch error");
+                break;
+            }
         }
-        int m = try_match();
-        if (m == 1) { verified = true; break; }
-        if (m < 0)  break;
+        // p == 0: poll timeout, no events. Loop and re-probe.
     }
 
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
