@@ -9,6 +9,7 @@
 #include <wayland-client.h>
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 
@@ -29,9 +30,17 @@ struct CopyState {
 void on_source_send(void* data, zwlr_data_control_source_v1*,
                     const char* mime_type, std::int32_t fd) {
     auto* st = static_cast<CopyState*>(data);
-    spdlog::info("[wlr] clipboard fetched: mime='{}' bytes={} fd={} (served #{})",
-                 mime_type, st->data.bytes.size(), fd, st->served + 1);
+    // Stopwatch covers the write itself — i.e. the time the consumer was
+    // blocked reading from the pipe waiting for our bytes. Doesn't include
+    // the compositor round-trip that delivered this `send` event.
+    auto t0 = std::chrono::steady_clock::now();
     detail::serve_send(fd, st->data.bytes.data(), st->data.bytes.size());
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    spdlog::info("[wlr] clipboard fetched: mime='{}' bytes={} (served #{}) "
+                 "in {}.{:03} ms",
+                 mime_type, st->data.bytes.size(), st->served + 1,
+                 us / 1000, us % 1000);
     st->served++;
     if (st->oneshot) st->done = true;
 }
@@ -211,12 +220,19 @@ bool DataControlBackend::paste(const wayland::SeatInfo& seat, Selection sel,
         zwlr_data_control_device_v1_destroy(device);
         return false;
     }
+    // Stopwatch: from "we asked the offer for data" to "all bytes drained".
+    // This is the latency the user perceives between issuing a paste and
+    // seeing the result on stdout.
+    auto t0 = std::chrono::steady_clock::now();
     zwlr_data_control_offer_v1_receive(offer->proxy, mime.c_str(),
                                        pipe.write_end.get());
     state_.flush();
     pipe.write_end.reset();
     out.bytes = core::drain_fd(pipe.read_end.get());
-    spdlog::debug("received {} bytes as '{}'", out.bytes.size(), mime);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    spdlog::info("[wlr] paste received: mime='{}' bytes={} in {}.{:03} ms",
+                 mime, out.bytes.size(), us / 1000, us % 1000);
 
     for (auto& o : st.offers) if (o->proxy) zwlr_data_control_offer_v1_destroy(o->proxy);
     zwlr_data_control_device_v1_destroy(device);

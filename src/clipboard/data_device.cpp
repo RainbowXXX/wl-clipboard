@@ -8,6 +8,7 @@
 
 #include <wayland-client.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <poll.h>
@@ -27,9 +28,14 @@ struct CopyState {
 void on_source_target(void*, wl_data_source*, const char*) {}
 void on_source_send(void* data, wl_data_source*, const char* m, std::int32_t fd) {
     auto* st = static_cast<CopyState*>(data);
-    spdlog::info("[wl] clipboard fetched: mime='{}' bytes={} fd={} (served #{})",
-                 m, st->data.bytes.size(), fd, st->served + 1);
+    auto t0 = std::chrono::steady_clock::now();
     detail::serve_send(fd, st->data.bytes.data(), st->data.bytes.size());
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    spdlog::info("[wl] clipboard fetched: mime='{}' bytes={} (served #{}) "
+                 "in {}.{:03} ms",
+                 m, st->data.bytes.size(), st->served + 1,
+                 us / 1000, us % 1000);
     st->served++;
     if (st->oneshot) st->done = true;
 }
@@ -192,10 +198,15 @@ bool DataDeviceBackend::paste(const wayland::SeatInfo& seat, Selection sel,
         wl_data_device_destroy(device);
         return false;
     }
+    auto t0 = std::chrono::steady_clock::now();
     wl_data_offer_receive(offer->proxy, mime.c_str(), pipe.write_end.get());
     state_.flush();
     pipe.write_end.reset();
     out.bytes = core::drain_fd(pipe.read_end.get());
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    spdlog::info("[wl] paste received: mime='{}' bytes={} in {}.{:03} ms",
+                 mime, out.bytes.size(), us / 1000, us % 1000);
 
     for (auto& o : st.offers) if (o->proxy) wl_data_offer_destroy(o->proxy);
     wl_data_device_destroy(device);

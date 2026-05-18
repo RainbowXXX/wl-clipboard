@@ -619,6 +619,7 @@ bool X11Backend::paste(const wayland::SeatInfo&, Selection sel,
     xcb_atom_t selatom = selection_atom(x.atoms, sel);
 
     // 1. Enumerate offered targets.
+    auto t_targets = std::chrono::steady_clock::now();
     if (!request_and_wait(x, selatom, x.atoms.TARGETS)) {
         spdlog::error("x11 paste: no {} owner or TARGETS unsupported",
                       sel == Selection::Primary ? "PRIMARY" : "CLIPBOARD");
@@ -626,6 +627,10 @@ bool X11Backend::paste(const wayland::SeatInfo&, Selection sel,
     }
     xcb_atom_t type = 0;
     auto raw = read_property(x, &type);
+    auto targets_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t_targets).count();
+    spdlog::info("[x11] paste TARGETS roundtrip: {}.{:03} ms",
+                 targets_us / 1000, targets_us % 1000);
     if (raw.empty() || (raw.size() % 4) != 0) {
         spdlog::error("x11 paste: TARGETS property empty/invalid");
         return false;
@@ -665,13 +670,17 @@ bool X11Backend::paste(const wayland::SeatInfo&, Selection sel,
         return false;
     }
 
+    auto t_data = std::chrono::steady_clock::now();
     if (!request_and_wait(x, selatom, target)) {
         spdlog::error("x11 paste: data convert refused");
         return false;
     }
     out.bytes = read_property(x, nullptr);
+    auto data_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t_data).count();
     out.mime  = mime;
-    spdlog::debug("x11 paste: {} bytes as '{}'", out.bytes.size(), mime);
+    spdlog::info("[x11] paste received: mime='{}' bytes={} in {}.{:03} ms",
+                 mime, out.bytes.size(), data_us / 1000, data_us % 1000);
     return true;
 }
 

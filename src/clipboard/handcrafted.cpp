@@ -7,6 +7,7 @@
 #include "wire/wire.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -392,12 +393,17 @@ bool HandcraftedBackend::copy(const wayland::SeatInfo&, Selection sel,
             if (op == zdcs::kEvSend) {
                 std::string mime = r.str();
                 int fd = cl.conn().pop_fd();
-                spdlog::info("[raw] clipboard fetched: mime='{}' bytes={} fd={} (served #{})",
-                             mime, st.data.bytes.size(), fd, st.served + 1);
+                auto t0 = std::chrono::steady_clock::now();
                 if (fd >= 0) {
                     detail::serve_send(fd, st.data.bytes.data(),
                                        st.data.bytes.size());
                 }
+                auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+                spdlog::info("[raw] clipboard fetched: mime='{}' bytes={} "
+                             "(served #{}) in {}.{:03} ms",
+                             mime, st.data.bytes.size(), st.served + 1,
+                             us / 1000, us % 1000);
                 st.served++;
                 if (st.oneshot) st.done = true;
             } else if (op == zdcs::kEvCancelled) {
@@ -572,6 +578,7 @@ bool HandcraftedBackend::paste(const wayland::SeatInfo&, Selection sel,
     if (!pipe.read_end || !pipe.write_end) return false;
 
     // offer.receive(mime, fd)
+    auto t0 = std::chrono::steady_clock::now();
     {
         wire::Writer w(off_id, zdco::kReqReceive);
         w.str(mime);
@@ -581,8 +588,10 @@ bool HandcraftedBackend::paste(const wayland::SeatInfo&, Selection sel,
     }
     cl.conn().flush();
     out.bytes = core::drain_fd(pipe.read_end.get());
-    spdlog::debug("handcrafted: received {} bytes as '{}'",
-                  out.bytes.size(), mime);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    spdlog::info("[raw] paste received: mime='{}' bytes={} in {}.{:03} ms",
+                 mime, out.bytes.size(), us / 1000, us % 1000);
     return true;
 }
 
