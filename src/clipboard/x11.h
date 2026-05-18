@@ -14,6 +14,7 @@
 
 #include "clipboard/backend.h"
 
+#include <functional>
 #include <string>
 
 namespace wlclip::wayland { struct SeatInfo; }
@@ -44,8 +45,18 @@ public:
     // observer polling the clipboard, because the bridge propagation can
     // start at "shell-return - epsilon" instead of "shell-return + 100-200ms"
     // (which is what happens if the caller daemonizes before doing any X).
+    //
+    // `after_fork_in_parent` (if set, and detach is true) runs in the parent
+    // process *after* fork() but *before* _exit(). The child is concurrently
+    // entering the SelectionRequest loop, so the callback may safely trigger
+    // operations that depend on the X owner being responsive (e.g. probing
+    // the wayland-side data_control device to verify the new selection has
+    // propagated). The callback's return value is ignored — the parent always
+    // _exit(0)s afterwards. The callback's responsibility is solely to *delay*
+    // _exit until some condition holds, not to abort.
     bool copy_acquire_then_detach(Selection sel, CopyData data,
-                                  bool oneshot, bool detach);
+                                  bool oneshot, bool detach,
+                                  std::function<void()> after_fork_in_parent = {});
 
 private:
     std::string display_;

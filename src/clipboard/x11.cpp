@@ -601,7 +601,8 @@ bool X11Backend::copy(const wayland::SeatInfo&, Selection sel,
 }
 
 bool X11Backend::copy_acquire_then_detach(Selection sel, CopyData data,
-                                          bool oneshot, bool detach) {
+                                          bool oneshot, bool detach,
+                                          std::function<void()> after_fork_in_parent) {
     CopyContext ctx;
     if (!acquire_selection(display_, sel, std::move(data), ctx)) {
         return false;
@@ -617,8 +618,16 @@ bool X11Backend::copy_acquire_then_detach(Selection sel, CopyData data,
             return false;
         }
         if (pid > 0) {
-            // Parent: bail out without unwinding. The X11Connection destructor
-            // would xcb_destroy_window (releasing ownership we just took) and
+            // Parent. The child is already executing serve_selection
+            // concurrently (or about to), so any X SelectionRequests that the
+            // wayland-side verify in `after_fork_in_parent` triggers will be
+            // serviced by the child. Parent MUST NOT touch the shared X
+            // socket here — child owns it from the X server's perspective.
+            if (after_fork_in_parent) {
+                after_fork_in_parent();
+            }
+            // Bail out without unwinding. The X11Connection destructor would
+            // xcb_destroy_window (releasing ownership we just took) and
             // xcb_disconnect (closing the shared X socket). _exit skips all
             // C++ destructors and atexit handlers — this is what xclip does.
             ::_exit(0);
