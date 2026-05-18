@@ -165,37 +165,53 @@ struct AdvertisedTargets {
 AdvertisedTargets build_targets(xcb_connection_t* c, const Atoms& a,
                                 const std::vector<std::string>& mimes) {
     AdvertisedTargets t;
-
-    // Pipeline all MIME atom interns first, then collect replies in order.
-    // Same trick as load_atoms: N sequential round-trips -> 1.
-    std::vector<xcb_intern_atom_cookie_t> cookies;
-    cookies.reserve(mimes.size());
-    for (const auto& m : mimes) {
-        cookies.push_back(xcb_intern_atom(
-            c, 0, static_cast<std::uint16_t>(m.size()), m.data()));
-    }
-
     auto add = [&](xcb_atom_t atom, std::string name) {
         if (atom == XCB_ATOM_NONE) return;
         if (std::find(t.atoms.begin(), t.atoms.end(), atom) != t.atoms.end()) return;
         t.atoms.push_back(atom);
         t.names.push_back(std::move(name));
     };
-    add(a.TARGETS,   "TARGETS");
-    add(a.TIMESTAMP, "TIMESTAMP");
+    add(a.TARGETS, "TARGETS");
+
+    // For text: advertise ONLY the X11-canonical atoms (UTF8_STRING, STRING,
+    // TEXT). Skip wayland-style "text/plain;charset=utf-8" / "text/plain"
+    // even if the caller put them on the MIME list — kwin / klipper's X-W
+    // bridge eagerly ConvertSelections every advertised target, so each
+    // extra synonym is one more bridge round-trip and one more cache
+    // bookkeeping step before the new selection becomes visible to wayland.
+    // The bridge maps UTF8_STRING -> text/plain;charset=utf-8 for wayland
+    // consumers automatically, so we lose nothing by not advertising the
+    // long form here. This mirrors xclip, which advertises {TARGETS,
+    // UTF8_STRING} for text (xclib.c:420-421) and reaches ~90ms steady
+    // state vs ~250ms for the fully-spelled-out list.
+    //
+    // Also do NOT advertise TIMESTAMP. We use CurrentTime in
+    // SetSelectionOwner so owner_time is 0, which is an invalid ICCCM
+    // timestamp; if a strict consumer queries TIMESTAMP and gets 0 it may
+    // refuse the selection or debounce. xclip doesn't advertise it either,
+    // so neither do we.
     bool has_text = false;
-    for (std::size_t i = 0; i < mimes.size(); ++i) {
-        const auto& m = mimes[i];
-        if (core::is_textual(m)) has_text = true;
-        auto* reply = xcb_intern_atom_reply(c, cookies[i], nullptr);
+    std::vector<std::string> non_text;
+    std::vector<xcb_intern_atom_cookie_t> non_text_cookies;
+    for (const auto& m : mimes) {
+        if (core::is_textual(m)) {
+            has_text = true;
+        } else {
+            non_text_cookies.push_back(xcb_intern_atom(
+                c, 0, static_cast<std::uint16_t>(m.size()), m.data()));
+            non_text.push_back(m);
+        }
+    }
+    for (std::size_t i = 0; i < non_text.size(); ++i) {
+        auto* reply = xcb_intern_atom_reply(c, non_text_cookies[i], nullptr);
         xcb_atom_t atom = reply ? reply->atom : XCB_ATOM_NONE;
         std::free(reply);
-        add(atom, m);
+        add(atom, non_text[i]);
     }
     if (has_text) {
         add(a.UTF8_STRING, "UTF8_STRING");
-        add(a.TEXT,        "TEXT");
         add(a.STRING,      "STRING");
+        add(a.TEXT,        "TEXT");
     }
     return t;
 }
